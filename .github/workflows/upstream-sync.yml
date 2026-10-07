@@ -1,0 +1,96 @@
+name: Sync upstream (preserve local workflows)
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: ${{ github.event.repository.fork }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Merge upstream and preserve local workflows
+        env:
+          UPSTREAM_REPO: "cmliu/CF-Workers-SUB"
+          UPSTREAM_BRANCH: "main"
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote remove upstream >/dev/null 2>&1 || true
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --prune upstream "${UPSTREAM_BRANCH}"
+
+          backup="$(mktemp -d)"
+          trap 'rm -rf "${backup}"' EXIT
+
+          # Keep this fork's workflow files as a local automation overlay.
+          if [ -d .github/workflows ]; then
+            mkdir -p "${backup}/.github"
+            cp -a .github/workflows "${backup}/.github/"
+          fi
+
+          before="$(git rev-parse HEAD)"
+
+          set +e
+          git merge --no-ff --no-commit "upstream/${UPSTREAM_BRANCH}"
+          merge_status=$?
+          set -e
+
+          if [ "${merge_status}" -ne 0 ]; then
+            unresolved="$(git diff --name-only --diff-filter=U)"
+            non_workflow_conflicts="$(printf '%s\n' "${unresolved}" | grep -v '^\.github/workflows/' || true)"
+
+            if [ -n "${non_workflow_conflicts}" ]; then
+              echo "❌ Upstream merge has non-workflow conflicts:"
+              printf '%s\n' "${non_workflow_conflicts}"
+              git merge --abort || true
+              exit 1
+            fi
+
+            echo "ℹ️ Only workflow files conflict; local workflow overlay will be kept."
+          fi
+
+          # Restore the exact pre-sync workflow tree. This avoids requiring the
+          # special Workflows permission when upstream changed .github/workflows.
+          rm -rf .github/workflows
+          if [ -d "${backup}/.github/workflows" ]; then
+            mkdir -p .github
+            cp -a "${backup}/.github/workflows" .github/
+          fi
+
+          git add -A .github/workflows
+
+          # All workflow conflicts must now be resolved by restoring our overlay.
+          remaining="$(git diff --name-only --diff-filter=U)"
+          if [ -n "${remaining}" ]; then
+            echo "❌ Unresolved conflicts remain:"
+            printf '%s\n' "${remaining}"
+            git merge --abort || true
+            exit 1
+          fi
+
+          if git diff --cached --quiet && [ "$(git rev-parse HEAD)" = "${before}" ]; then
+            echo "✅ Already up to date."
+            exit 0
+          fi
+
+          git commit --no-edit -m "Merge upstream ${UPSTREAM_REPO}:${UPSTREAM_BRANCH} (preserve local workflows)"
+          git push origin "HEAD:${UPSTREAM_BRANCH}"
+
+          echo "✅ Upstream synchronized; local .github/workflows overlay preserved."
